@@ -42,6 +42,10 @@ SUPPORTED_TASKS = [
     "WATCH_VIDEO_ON_MOBILE",
 ]
 
+# Lưu trữ token người dùng kèm thời hạn 2 tuần (14 ngày = 1209600 giây)
+SAVED_USER_TOKENS = {} 
+TOKEN_EXPIRE_SECONDS = 14 * 24 * 60 * 60  
+
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 class Colors:
@@ -393,6 +397,75 @@ class AgreeRulesView(discord.ui.View):
         await interaction.response.send_message("❌ Bạn đã từ chối điều khoản.", ephemeral=True)
 
 
+class TokenModal(discord.ui.Modal, title="🔑 Kiểm tra & Xác thực Token"):
+    token_input = discord.ui.TextInput(
+        label="Discord User Token",
+        placeholder="Dán token cá nhân của bạn vào đây...",
+        style=discord.TextStyle.short,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        token = self.token_input.value.strip()
+        build_num = fetch_latest_build_number()
+        api = DiscordAPI(token, build_num)
+        
+        user_data = api.validate_token()
+        if not user_data or "id" not in user_data:
+            await interaction.followup.send("❌ **Token không hợp lệ hoặc đã hết hạn!**", ephemeral=True)
+            return
+            
+        user_id = user_data.get("id")
+        
+        # Lưu token kèm thời hạn 2 tuần
+        expire_time = time.time() + TOKEN_EXPIRE_SECONDS
+        SAVED_USER_TOKENS[user_id] = {
+            "token": token,
+            "expire_at": expire_time
+        }
+        
+        # Tiến hành quét danh sách Quest của người dùng
+        completer = QuestAutocompleter(api)
+        quests = completer.fetch_quests()
+        pending_quests = [
+            q for q in quests 
+            if not is_completed(q) and is_completable(q)
+        ]
+        
+        username = user_data.get("username", "Unknown")
+        global_name = user_data.get("global_name", username)
+        
+        embed = discord.Embed(
+            title="✅ XÁC THỰC THÀNH CÔNG & QUÉT QUEST",
+            description=f"Xin chào **{global_name}** (`{username}`). Token đã được lưu trữ trong 2 tuần.",
+            color=discord.Color.green()
+        )
+        
+        if pending_quests:
+            quest_list_str = ""
+            for idx, q in enumerate(pending_quests, 1):
+                q_name = _get(q, "name") or _get(_get(q, "config", {}), "messages", {}).get("gameTitle", "Quest Discord")
+                enrolled_status = "Đã nhận (Enrolled)" if is_enrolled(q) else "Chưa nhận (Not Enrolled)"
+                quest_list_str += f"**{idx}.** {q_name} — *Trạng thái: {enrolled_status}*\n"
+            
+            embed.add_field(name=f"🎮 Các Quest CHƯA LÀM ({len(pending_quests)}):", value=quest_list_str, inline=False)
+        else:
+            embed.add_field(name="🎮 Trạng thái Quest:", value="Tuyệt vời! Bạn đã hoàn thành tất cả các Quest hiện có hoặc không có Quest nào khả dụng.", inline=False)
+            
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class TokenView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔑 Nhập Token kiểm tra", style=discord.ButtonStyle.blurple, custom_id="persistent_token_button")
+    async def token_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await try_react_custom_emoji(interaction)
+        await interaction.response.send_modal(TokenModal())
+
+
 @tasks.loop(hours=24)
 async def check_birthdays_task():
     now = datetime.now()
@@ -418,14 +491,28 @@ async def check_birthdays_task():
                         pass
 
 
+@tasks.loop(hours=1)
+async def cleanup_expired_tokens():
+    current_time = time.time()
+    expired_users = [
+        uid for uid, data in SAVED_USER_TOKENS.items() 
+        if current_time > data["expire_at"]
+    ]
+    for uid in expired_users:
+        del SAVED_USER_TOKENS[uid]
+
+
 @bot.event
 async def on_ready():
     bot.add_view(BirthdayView())
     bot.add_view(VerifyView())
     bot.add_view(AgreeRulesView("Member"))
+    bot.add_view(TokenView())
     
     if not check_birthdays_task.is_running():
         check_birthdays_task.start()
+    if not cleanup_expired_tokens.is_running():
+        cleanup_expired_tokens.start()
         
     log(f"Discord Bot đã sẵn sàng: {bot.user.name}", "ok")
     try:
@@ -448,13 +535,79 @@ async def on_member_join(member: discord.Member):
 
 
 # ── Lệnh Slash: /auto ──────────────────────────────────────────────────────────
-@bot.tree.command(name="auto", description="Thông báo về quyền truy cập Quest")
+@bot.tree.command(name="auto", description="Tự động quét và hoàn thành các Quest Discord chưa làm")
 async def slash_auto(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "❌ Tính năng Auto Quest không được hỗ trợ qua user token. "
-        "Hãy dùng OAuth2/API chính thức của Discord.",
-        ephemeral=True,
+    await interaction.response.defer(ephemeral=True)
+    user_id = interaction.user.id
+    
+    user_token_data = SAVED_USER_TOKENS.get(user_id)
+    if not user_token_data or time.time() > user_token_data["expire_at"]:
+        await interaction.followup.send(
+            "❌ Bạn chưa nhập token hoặc token đã hết hạn lưu trữ (2 tuần).\n"
+            "Vui lòng sử dụng lệnh `/token` để nhập và lưu token trước khi chạy auto!", 
+            ephemeral=True
+        )
+        return
+        
+    token = user_token_data["token"]
+    build_num = fetch_latest_build_number()
+    api = DiscordAPI(token, build_num)
+    
+    user_data = api.validate_token()
+    if not user_data or "id" not in user_data:
+        await interaction.followup.send("❌ **Token của bạn không hợp lệ hoặc đã hết hạn trên Discord!** Hãy cập nhật lại bằng lệnh `/token`.", ephemeral=True)
+        return
+        
+    completer = QuestAutocompleter(api)
+    quests = completer.fetch_quests()
+    
+    if not quests:
+        await interaction.followup.send("⚠️ Không tìm thấy Quest nào khả dụng trên tài khoản của bạn.", ephemeral=True)
+        return
+        
+    quests = completer.auto_accept(quests)
+    actionable = [q for q in quests if is_enrolled(q) and not is_completed(q) and is_completable(q)]
+    
+    if not actionable:
+        await interaction.followup.send("✅ Tuyệt vời! Tất cả các Quest hiện tại đã hoàn thành hoặc không có quest nào cần làm.", ephemeral=True)
+        return
+        
+    embed = discord.Embed(
+        title="🚀 HỆ THỐNG AUTO QUEST ĐANG CHẠY",
+        description=f"Đã tìm thấy **{len(actionable)}** quest chưa hoàn thành. Bot đang tiến hành chạy ngầm để hoàn thành cho bạn...",
+        color=discord.Color.from_rgb(0, 255, 127)
     )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    for q in actionable:
+        try:
+            completer.process_quest(q)
+            time.sleep(2)
+        except Exception:
+            pass
+            
+    done_embed = discord.Embed(
+        title="✨ HOÀN TẤT AUTO QUEST",
+        description="Quá trình tự động chạy hoàn thành các nhiệm vụ đã kết thúc!",
+        color=discord.Color.green()
+    )
+    await interaction.followup.send(embed=done_embed, ephemeral=True)
+
+
+# ── Lệnh Slash: /token ─────────────────────────────────────────────────────────
+@bot.tree.command(name="token", description="Gửi bảng giao diện để kiểm tra thông tin Discord User Token")
+async def slash_token(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Thiếu quyền Quản trị viên!", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="🔑 HỆ THỐNG KIỂM TRA TOKEN",
+        description="Bấm vào nút bên dưới để mở bảng nhập, kiểm tra thông tin tài khoản và lưu token tự động trong 2 tuần.",
+        color=discord.Color.blurple()
+    )
+    view = TokenView()
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ Đã gửi bảng giao diện kiểm tra token!", ephemeral=True)
 
 
 @bot.tree.command(name="agree", description="Gửi bảng nội quy")
@@ -472,8 +625,11 @@ async def slash_agree(interaction: discord.Interaction, channel: Optional[discor
 
 @bot.tree.command(name="help", description="Hiển thị hướng dẫn sử dụng")
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 TRỢ GIÚP", description="Danh sách lệnh bot:", color=discord.Color.orange())
-    embed.add_field(name="/auto", value="Thông tin về quyền truy cập Quest an toàn.", inline=False)
+    embed = discord.Embed(title="📖 TRỢ GIÚP - CTDOTEAM", description="Danh sách các lệnh bot:", color=discord.Color.orange())
+    embed.add_field(name="/auto", value="Tự động quét và chạy hoàn thành các Quest Discord chưa làm.", inline=False)
+    embed.add_field(name="/token", value="Mở bảng nhập token, kiểm tra thông tin tài khoản và lưu trong 2 tuần.", inline=False)
+    embed.add_field(name="/agree", value="Gửi bảng nội quy server để nhận role.", inline=False)
+    embed.add_field(name="/setup", value="Cài đặt các tính năng hệ thống (Welcome, Birthday, Verify).", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
